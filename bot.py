@@ -5,7 +5,6 @@ import time
 from datetime import datetime
 import redis
 
-# Imports for the web server
 from flask import Flask
 from threading import Thread
 from waitress import serve
@@ -22,20 +21,24 @@ API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID"))
 REDIS_URL = os.getenv("REDIS_URL")
+USER_SESSION_STRING = os.getenv("USER_SESSION_STRING")
 
-# --- PYROGRAM BOT CLIENT ---
-app = Client("copier_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+# --- DUAL CLIENT SETUP ---
+# The bot client that performs all actions
+bot_app = Client("copier_bot_instance", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+
+# The user client, used ONLY for looking up chats reliably.
+# It authenticates using the session string, avoiding interactive login on the server.
+user_client = Client("user_session_instance", session_string=USER_SESSION_STRING, api_id=API_ID, api_hash=API_HASH)
 
 # --- STATE MANAGEMENT ---
 active_jobs = {}
-
-# --- REDIS INITIALIZATION ---
 redis_client = None
+
 def init_redis():
-    """Initializes the Redis client and tests the connection."""
     global redis_client
     if not REDIS_URL:
-        print("FATAL: REDIS_URL environment variable is not set.")
+        print("FATAL: REDIS_URL is not set.")
         sys.exit(1)
     try:
         redis_client = redis.from_url(REDIS_URL, decode_responses=True)
@@ -46,87 +49,67 @@ def init_redis():
         sys.exit(1)
 
 # ############################################################################
-# --- COPIER: BOT-INTEGRATED WORKER CLASS ---
+# --- COPIER CLASS (Now uses both clients) ---
 # ############################################################################
 class TelegramCopier:
-    def __init__(self, bot_client: Client, status_message, redis_conn):
+    def __init__(self, bot_client: Client, user_client: Client, status_message, redis_conn):
         self.bot_client = bot_client
+        self.user_client = user_client # <-- Store the user client
         self.status_message = status_message
         self.redis = redis_conn
         self.log_buffer = []
         self.last_update_time = 0
 
+    # _log, _get_existing_mappings, _add_mapping methods are UNCHANGED
     async def _log(self, message):
-        """
-        Appends a log message and updates the status message as plain text to avoid formatting errors.
-        """
         timestamp = datetime.now().strftime('%H:%M:%S')
-        # Sanitize the message to prevent any markdown interpretation issues
         safe_message = message.replace('`', "'").replace('*', '').replace('_', '').replace('[', '(').replace(']', ')')
         self.log_buffer.append(f"{timestamp}: {safe_message}")
-
-        if len(self.log_buffer) > 15:
-            self.log_buffer.pop(0)
-
+        if len(self.log_buffer) > 15: self.log_buffer.pop(0)
         current_time = time.time()
-        # Update status message every 3 seconds to avoid hitting rate limits
         if current_time - self.last_update_time > 3:
             try:
                 log_text = "\n".join(self.log_buffer)
-                # Use parse_mode=None to send as plain text, preventing ENTITY_BOUNDS_INVALID
-                await self.status_message.edit_text(
-                    f"Copy Job in Progress...\n\n---\n{log_text}",
-                    parse_mode=None
-                )
-                self.last_update_time = current_time
+                await self.status_message.edit_text(f"Copy Job in Progress...\n\n---\n{log_text}", parse_mode=None)
             except exceptions.FloodWait as e:
-                print(f"WARN: Flood wait of {e.value}s on status update.")
                 await asyncio.sleep(e.value)
-            except Exception as e:
-                # Ignore errors like "message not modified"
-                if "message not modified" not in str(e):
-                    print(f"Error updating status message: {e}")
-
+            except Exception: pass
+    
     def _get_existing_mappings(self, source_chat_id, ids_to_check):
-        """Checks for existing message IDs in a Redis Set using a pipeline."""
-        if not ids_to_check:
-            return set()
+        if not ids_to_check: return set()
         redis_set_key = f"copier_map:{source_chat_id}"
         pipe = self.redis.pipeline()
-        for msg_id in ids_to_check:
-            pipe.sismember(redis_set_key, str(msg_id))
+        for msg_id in ids_to_check: pipe.sismember(redis_set_key, str(msg_id))
         results = pipe.execute()
         return {ids_to_check[i] for i, exists in enumerate(results) if exists}
 
     def _add_mapping(self, source_chat_id, source_message_id):
-        """Adds a message ID to the Redis Set for the source chat."""
         try:
             redis_set_key = f"copier_map:{source_chat_id}"
             self.redis.sadd(redis_set_key, str(source_message_id))
-        except Exception as e:
-            asyncio.create_task(self._log(f"Redis Error: {e}"))
+        except Exception as e: asyncio.create_task(self._log(f"Redis Error: {e}"))
 
     async def run_copy_task(self, source_input, target_input, start_id, end_id, delay):
         try:
-            # Step 1: Resolve peers to prevent PEER_ID_INVALID
-            await self._log("Resolving chats...")
+            # Step 1: Use the USER CLIENT to reliably get chat objects
+            await self._log("Resolving chats using user session...")
             try:
-                await self.bot_client.resolve_peer(source_input)
-                await self.bot_client.resolve_peer(target_input)
-                source_chat = await self.bot_client.get_chat(source_input)
-                target_chat = await self.bot_client.get_chat(target_input)
+                # This is the key change. The user client will not fail with PEER_ID_INVALID.
+                source_chat = await self.user_client.get_chat(source_input)
+                target_chat = await self.user_client.get_chat(target_input)
             except Exception as e:
-                await self._log(f"ERROR: Could not access chats. Ensure bot is in the target group and the source is valid. Details: {e}")
+                await self._log(f"ERROR: Could not access chats via user session. Ensure your user account is in the private chats. Details: {e}")
                 return
 
             await self._log(f"Source: {source_chat.title}")
             await self._log(f"Target: {target_chat.title}")
 
+            # All subsequent operations use the BOT client
             if not target_chat.is_forum:
                 await self._log("ERROR: Target chat must have Topics enabled.")
                 return
 
-            # Step 2: Find or Create Topic
+            # Step 2: Find or Create Topic (using the BOT client)
             source_title = source_chat.title
             target_topic_id = None
             await self._log(f"Searching for topic: '{source_title}'...")
@@ -141,10 +124,10 @@ class TelegramCopier:
                     target_topic_id = new_topic.id
                     await self._log(f"Created new topic (ID: {target_topic_id})")
                 except Exception as e:
-                    await self._log(f"ERROR: Failed to create topic. Check bot permissions. Details: {e}")
+                    await self._log(f"ERROR: Bot failed to create topic. Check bot permissions. Details: {e}")
                     return
 
-            # Step 3: Pre-check and Copy Loop
+            # Step 3: Pre-check and Copy Loop (using the BOT client)
             all_possible_ids = list(range(start_id, end_id + 1))
             existing_ids = self._get_existing_mappings(source_chat.id, all_possible_ids)
             ids_to_process = [mid for mid in all_possible_ids if mid not in existing_ids]
@@ -161,6 +144,7 @@ class TelegramCopier:
                     if asyncio.current_task().cancelled():
                         await self._log("Task cancelled. Stopping.")
                         break
+                    # The actual copy is done by the BOT client
                     await self.bot_client.copy_message(target_chat.id, source_chat.id, msg_id, reply_to_message_id=target_topic_id)
                     self._add_mapping(source_chat.id, msg_id)
                     success += 1
@@ -185,19 +169,16 @@ class TelegramCopier:
             raise
 
 
-# --- BOT COMMAND HANDLERS ---
+# --- BOT COMMAND HANDLERS (use bot_app) ---
 admin_filter = filters.user(ADMIN_USER_ID)
-
-@app.on_message(filters.command("start") & admin_filter)
+@bot_app.on_message(filters.command("start") & admin_filter)
 async def start_handler(c, m): await m.reply_text("Admin, welcome! Use /help.")
-
-@app.on_message(filters.command("help") & admin_filter)
+# ... other handlers ...
+@bot_app.on_message(filters.command("help") & admin_filter)
 async def help_handler(c, m): await m.reply_text("`/copy <src> <tgt> <range>`\n`/cancel`\n`/status`")
-
-@app.on_message(filters.command("status") & admin_filter)
+@bot_app.on_message(filters.command("status") & admin_filter)
 async def status_handler(c, m): await m.reply_text("A job is running." if ADMIN_USER_ID in active_jobs else "No active job.")
-
-@app.on_message(filters.command("cancel") & admin_filter)
+@bot_app.on_message(filters.command("cancel") & admin_filter)
 async def cancel_handler(c, m):
     if ADMIN_USER_ID in active_jobs:
         active_jobs[ADMIN_USER_ID].cancel()
@@ -205,8 +186,8 @@ async def cancel_handler(c, m):
     else:
         await m.reply_text("No job to cancel.")
 
-@app.on_message(filters.command("copy") & admin_filter)
-async def copy_handler(client, message):
+@bot_app.on_message(filters.command("copy") & admin_filter)
+async def copy_handler(client, message): # client here is the bot_app
     if ADMIN_USER_ID in active_jobs:
         await message.reply_text("Job already in progress. Use /cancel first.")
         return
@@ -214,14 +195,14 @@ async def copy_handler(client, message):
         _, source, target, id_range = message.text.split()
         start_id, end_id = map(int, id_range.split('-'))
         if start_id > end_id:
-            await message.reply_text("ERROR: Start ID cannot be greater than End ID.")
+            await message.reply_text("ERROR: Start ID > End ID.")
             return
     except ValueError:
         await message.reply_text("Invalid format. Use: `/copy <src> <tgt> <start-end>`")
         return
 
     status_message = await message.reply_text("Job accepted. Initializing...")
-    copier = TelegramCopier(bot_client=client, status_message=status_message, redis_conn=redis_client)
+    copier = TelegramCopier(bot_client=client, user_client=user_client, status_message=status_message, redis_conn=redis_client)
     task = asyncio.create_task(copier.run_copy_task(source, target, start_id, end_id, delay=2.0))
     active_jobs[ADMIN_USER_ID] = task
 
@@ -242,17 +223,20 @@ async def copy_handler(client, message):
 # --- WEB SERVER FOR KEEP-ALIVE ---
 web_app = Flask(__name__)
 @web_app.route('/')
-def index():
-    return "Bot is alive!", 200
-def run_web_server():
-    serve(web_app, host="0.0.0.0", port=10000)
+def index(): return "Bot is alive!", 200
+def run_web_server(): serve(web_app, host="0.0.0.0", port=10000)
 
 # --- MAIN EXECUTION BLOCK ---
-if __name__ == "__main__":
+async def main():
     init_redis()
     web_thread = Thread(target=run_web_server)
     web_thread.daemon = True
     web_thread.start()
-    print("Bot and web server are starting...")
-    app.run()
-    print("Bot has stopped.")
+    print("Starting clients...")
+    await user_client.start()
+    await bot_app.start()
+    print("Bot and web server are running.")
+    await asyncio.Event().wait() # Keep the main function alive
+
+if __name__ == "__main__":
+    asyncio.run(main())
