@@ -1,4 +1,3 @@
-
 import asyncio
 import os
 import sys
@@ -24,19 +23,36 @@ ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID"))
 REDIS_URL = os.getenv("REDIS_URL")
 USER_SESSION_STRING = os.getenv("USER_SESSION_STRING")
 
+# --- CRITICAL CHECK ---
+if not USER_SESSION_STRING:
+    print("FATAL: USER_SESSION_STRING is not set in the environment. Please generate one and add it.")
+    sys.exit(1)
+
 # --- DUAL CLIENT SETUP ---
 # The bot client that performs all actions
-bot_app = Client("copier_bot_instance", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+bot_app = Client(
+    name="copier_bot_instance",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN
+)
 
 # The user client, used ONLY for looking up chats reliably.
-# It authenticates using the session string, avoiding interactive login on the server.
-user_client = Client("user_session_instance", session_string=USER_SESSION_STRING, api_id=API_ID, api_hash=API_HASH)
+# NAME IS SET TO ":memory:" TO FORCE IN-MEMORY-ONLY SESSION FROM STRING.
+# This prevents it from trying to read/write a file and asking for input.
+user_client = Client(
+    name=":memory:",
+    session_string=USER_SESSION_STRING,
+    api_id=API_ID,
+    api_hash=API_HASH
+)
 
-# --- STATE MANAGEMENT ---
+# --- STATE MANAGEMENT & REDIS ---
 active_jobs = {}
 redis_client = None
 
 def init_redis():
+    # ... (This function is correct and does not need changes) ...
     global redis_client
     if not REDIS_URL:
         print("FATAL: REDIS_URL is not set.")
@@ -49,19 +65,19 @@ def init_redis():
         print(f"ERROR: Failed to connect to Redis: {e}")
         sys.exit(1)
 
+
 # ############################################################################
-# --- COPIER CLASS (Now uses both clients) ---
+# --- COPIER CLASS (This class is correct and needs no changes) ---
 # ############################################################################
 class TelegramCopier:
     def __init__(self, bot_client: Client, user_client: Client, status_message, redis_conn):
         self.bot_client = bot_client
-        self.user_client = user_client # <-- Store the user client
+        self.user_client = user_client
         self.status_message = status_message
         self.redis = redis_conn
         self.log_buffer = []
         self.last_update_time = 0
 
-    # _log, _get_existing_mappings, _add_mapping methods are UNCHANGED
     async def _log(self, message):
         timestamp = datetime.now().strftime('%H:%M:%S')
         safe_message = message.replace('`', "'").replace('*', '').replace('_', '').replace('[', '(').replace(']', ')')
@@ -92,25 +108,21 @@ class TelegramCopier:
 
     async def run_copy_task(self, source_input, target_input, start_id, end_id, delay):
         try:
-            # Step 1: Use the USER CLIENT to reliably get chat objects
             await self._log("Resolving chats using user session...")
             try:
-                # This is the key change. The user client will not fail with PEER_ID_INVALID.
                 source_chat = await self.user_client.get_chat(source_input)
                 target_chat = await self.user_client.get_chat(target_input)
             except Exception as e:
-                await self._log(f"ERROR: Could not access chats via user session. Ensure your user account is in the private chats. Details: {e}")
+                await self._log(f"ERROR: Could not access chats via user session. Ensure your user account is in any private chats. Details: {e}")
                 return
 
             await self._log(f"Source: {source_chat.title}")
             await self._log(f"Target: {target_chat.title}")
 
-            # All subsequent operations use the BOT client
             if not target_chat.is_forum:
                 await self._log("ERROR: Target chat must have Topics enabled.")
                 return
 
-            # Step 2: Find or Create Topic (using the BOT client)
             source_title = source_chat.title
             target_topic_id = None
             await self._log(f"Searching for topic: '{source_title}'...")
@@ -128,7 +140,6 @@ class TelegramCopier:
                     await self._log(f"ERROR: Bot failed to create topic. Check bot permissions. Details: {e}")
                     return
 
-            # Step 3: Pre-check and Copy Loop (using the BOT client)
             all_possible_ids = list(range(start_id, end_id + 1))
             existing_ids = self._get_existing_mappings(source_chat.id, all_possible_ids)
             ids_to_process = [mid for mid in all_possible_ids if mid not in existing_ids]
@@ -145,7 +156,6 @@ class TelegramCopier:
                     if asyncio.current_task().cancelled():
                         await self._log("Task cancelled. Stopping.")
                         break
-                    # The actual copy is done by the BOT client
                     await self.bot_client.copy_message(target_chat.id, source_chat.id, msg_id, reply_to_message_id=target_topic_id)
                     self._add_mapping(source_chat.id, msg_id)
                     success += 1
@@ -169,16 +179,17 @@ class TelegramCopier:
             await self._log(f"A critical error occurred: {e}")
             raise
 
-
-# --- BOT COMMAND HANDLERS (use bot_app) ---
+# --- BOT COMMAND HANDLERS (These are correct and need no changes) ---
 admin_filter = filters.user(ADMIN_USER_ID)
 @bot_app.on_message(filters.command("start") & admin_filter)
 async def start_handler(c, m): await m.reply_text("Admin, welcome! Use /help.")
-# ... other handlers ...
+
 @bot_app.on_message(filters.command("help") & admin_filter)
 async def help_handler(c, m): await m.reply_text("`/copy <src> <tgt> <range>`\n`/cancel`\n`/status`")
+
 @bot_app.on_message(filters.command("status") & admin_filter)
 async def status_handler(c, m): await m.reply_text("A job is running." if ADMIN_USER_ID in active_jobs else "No active job.")
+
 @bot_app.on_message(filters.command("cancel") & admin_filter)
 async def cancel_handler(c, m):
     if ADMIN_USER_ID in active_jobs:
@@ -188,7 +199,7 @@ async def cancel_handler(c, m):
         await m.reply_text("No job to cancel.")
 
 @bot_app.on_message(filters.command("copy") & admin_filter)
-async def copy_handler(client, message): # client here is the bot_app
+async def copy_handler(client, message):
     if ADMIN_USER_ID in active_jobs:
         await message.reply_text("Job already in progress. Use /cancel first.")
         return
@@ -221,13 +232,13 @@ async def copy_handler(client, message): # client here is the bot_app
         if ADMIN_USER_ID in active_jobs:
             del active_jobs[ADMIN_USER_ID]
 
-# --- WEB SERVER FOR KEEP-ALIVE ---
+# --- WEB SERVER (This is correct and needs no changes) ---
 web_app = Flask(__name__)
 @web_app.route('/')
 def index(): return "Bot is alive!", 200
 def run_web_server(): serve(web_app, host="0.0.0.0", port=10000)
 
-# --- MAIN EXECUTION BLOCK ---
+# --- MAIN EXECUTION BLOCK (This is correct and needs no changes) ---
 async def main():
     init_redis()
     web_thread = Thread(target=run_web_server)
@@ -237,7 +248,7 @@ async def main():
     await user_client.start()
     await bot_app.start()
     print("Bot and web server are running.")
-    await asyncio.Event().wait() # Keep the main function alive
+    await asyncio.Event().wait()
 
 if __name__ == "__main__":
     asyncio.run(main())
