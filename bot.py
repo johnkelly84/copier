@@ -90,14 +90,20 @@ class TelegramCopier:
             asyncio.create_task(self._log(f"Redis Error: {e}"))
 
     async def run_copy_task(self, source_input, target_input, start_id, end_id, delay):
-        try:
-            source_chat = await self.bot_client.get_chat(source_input)
-            target_chat = await self.bot_client.get_chat(target_input)
-            await self._log(f"✅ Source: **{source_chat.title}**")
-            await self._log(f"✅ Target: **{target_chat.title}**")
-            if not target_chat.is_forum:
-                await self._log("❌ **Error:** Target chat must have Topics enabled.")
-                return
+        # --- New and Corrected Code ---
+try:
+    # Use resolve_peer to "prime the pump" and ensure the bot knows the chat.
+    # This is the key step to prevent PEER_ID_INVALID for public channels.
+    await self.bot_client.resolve_peer(source_input)
+    await self.bot_client.resolve_peer(target_input)
+
+    # Now that the peer is resolved, get_chat will work reliably.
+    source_chat = await self.bot_client.get_chat(source_input)
+    target_chat = await self.bot_client.get_chat(target_input)
+except Exception as e:
+    # The error might now be more specific, like UsernameNotOccupied if the channel doesn't exist
+    await self._log(f"❌ **Error:** Could not access chats. Ensure the bot is in the target group and the source is a valid public channel. Details: `{e}`")
+    return
             source_title = source_chat.title
             target_topic_id = None
             await self._log(f"🔎 Searching for topic: '{source_title}'...")
